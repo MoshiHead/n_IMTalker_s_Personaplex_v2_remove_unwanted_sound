@@ -592,6 +592,11 @@ class MoshiOnlyEngineWithHidden(MoshiOnlyEngine):
         # "$1,408.50", and its first audio came 0.03s after the question,
         # about five seconds BEFORE the reference existed.
         self.suppress_text_until_ref = False
+        # How many consecutive frames the PRE-EMPTIVE hold in _stt_step has
+        # forced suppress_text_until_ref True without a real turn ever
+        # claiming ownership of it (search_awaiting_ref). See _stt_step for
+        # why this needs its own bound.
+        self._preemptive_hold_frames = 0
         self._pending_ref_token_counts = (0, 0)
         self.search_filler_frame_count = 0
         self.search_session_history: list[tuple[str, str]] = []
@@ -686,13 +691,32 @@ class MoshiOnlyEngineWithHidden(MoshiOnlyEngine):
         # knowledge). Gated on `search_enabled` too, so builds with search
         # entirely disabled never pay this hold -- there is no decision to
         # wait for in that configuration.
+        #
+        # `stt_in_utterance` is not a clean edge-triggered signal: the STT
+        # submodel can still emit a stray trailing (non-padding) token for a
+        # frame or two right after the true end of an utterance (decode
+        # lag), which flips it back to True with no real new question behind
+        # it. For a turn that just resolved as "no search needed", nothing
+        # else ever re-examines suppress_text_until_ref, so one such stray
+        # token used to latch it back on and leave the model silenced for
+        # the rest of the turn -- confirmed in conversation_log_2, where
+        # every casual (no-search) turn but one produced no speech at all.
+        # `_preemptive_hold_frames` bounds this mechanism's own hold to one
+        # confirmation window: if nothing has claimed real ownership
+        # (search_awaiting_ref True) within _VAD_SILENCE_FRAMES_REQUIRED
+        # frames of it engaging, it releases unconditionally rather than
+        # hanging until another full utterance is confirmed.
         if getattr(self, "search_enabled", False) and not self.search_awaiting_ref:
             if self.stt_in_utterance and self.stt_silence_frame_count > 0:
-                self.suppress_text_until_ref = True
-            elif self.suppress_text_until_ref:
-                # False alarm: the user resumed talking before the pause was
-                # confirmed as the end of the utterance. Release the hold.
-                self.suppress_text_until_ref = False
+                self._preemptive_hold_frames += 1
+                self.suppress_text_until_ref = self._preemptive_hold_frames <= self._VAD_SILENCE_FRAMES_REQUIRED
+            else:
+                self._preemptive_hold_frames = 0
+                if self.suppress_text_until_ref:
+                    # Either a false alarm (user resumed talking before the
+                    # pause was confirmed as the end of the utterance), or
+                    # the timeout above just fired. Release the hold.
+                    self.suppress_text_until_ref = False
 
         vad_fired = (
             self.stt_silence_frame_count >= self._VAD_SILENCE_FRAMES_REQUIRED
